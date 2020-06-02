@@ -1,0 +1,233 @@
+---
+title: "Clinical Legacy Code Analysis"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    theme: yeti
+    source_code: embed
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+# load data in 'global' chunk so it can be shared
+# by all users of the dashboard
+library(flexdashboard)
+library(tidyverse)
+library(lubridate)
+library(eeptools)
+library(knitr)
+#This dashboard uses the package dbplyr to query a SQL server. This converts the dplyr syntax into SQL.
+#dbplyr is installed with tidyverse.
+#(goal of dbplyr is to automatically generate SQL for you)
+#The advantage of this, is it allows you to query a large dataset without bringing the data into memory. The data analysed here was substantial, so importing it 
+#all into R was not feasible.
+#The R code is translated into SQL and executed in the database - data is never pulled into R unless you ask for it.
+#You can do this using the function collect(), which pulls the data into a local tibble.
+#for more details, see... https://db.rstudio.com/dplyr/
+#note you do not have to specifically load dbplyr - it is loaded by dplyr when you work with #a database.
+#dbplyr
+library(dbplyr)
+#library(plotly)
+
+options(shiny.sanitize.errors = TRUE)
+
+#To work with a database in dplyr, you must first connect to it, using DBI::dbConnect()
+
+con <- DBI::dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "####",
+                      MultipleActiveResultSets = "True",
+                      Database = "####")
+
+#Below are some example tables, which are joined together later to produce a final clean table with all the details required.
+
+#Now that we have a connection, we can reference tables within the server using tbl().
+
+#CareRecord Observation Table (activity)
+obs <- tbl(con, in_schema("####", "####"))
+
+#dbo.Patient Table (patient details)
+pat <- tbl(con, in_schema("####", "####"))
+
+#UserInRole Table (system user details)
+uir <- tbl(con, in_schema("####", "####"))
+
+#User Table (additional user details)
+user <- tbl(con, in_schema("####","####"))
+
+#extract distinct list of legacy codes for selector used by end user
+legacy_codes <- obs %>%
+  select(LegacyCode) %>%
+  collect() %>%
+  distinct(LegacyCode, .keep_all = FALSE)
+
+```
+
+
+Template Extractor {data-icon="fa-table"}
+===================================== 
+
+Column {.sidebar}
+-----------------------------------------------------------------------
+Sidebar to input codes to search for, and adjust any other filters as needed.
+
+Once you have defined your dataset, click 'download' for a CSV file including the backing data.
+
+```{r}
+
+#usual text input
+#textInput("text", "Text")
+
+#selectize - function for mutliple text entries
+
+#the selector below allows the user to input multiple codes. It also produces an auto complete list, for which you can define the list size.
+
+selectizeInput("text_string", "Enter Read Codes:", choices = legacy_codes, multiple = TRUE, options = list(maxOptions = 5))
+
+## Download Button - downloads CSV file of selected data
+
+downloadButton("downloadData", "Download")
+
+downloadHandler(
+    filename = function() {
+      paste(c(input$text_string), ".csv", sep = "")
+    },
+    content = function(file) {
+      write.csv(data_mutate(), file, row.names = FALSE)
+    }
+  )
+
+```
+
+
+Column {data-width=750}
+-----------------------------------------------------------------------
+
+### Data Table
+
+```{r}
+
+#The 'base_data' queries the SQL server using dplyr syntax, and returns the final 'base_data', to be used by all proceeding queries.
+
+base_data <- reactive({ #so as described earlier, the first part of this query does all the work on the server, nothing is downloaded into R
+        data <- obs %>%
+            select(ObservationId, PatientId, AuthorisingUserInRoleId, LegacyCode, OriginalTerm, EffectiveDate, NumericValue) %>%
+          #joining the previously referenced tables together.
+            left_join(pat, by = "PatientId") %>%
+            left_join(uir, c("AuthorisingUserInRoleId" = "UserInRoleId")) %>%
+            left_join(user, by = "UserId") %>%
+            select(PatientId, DateOfBirth, Sex.x, PatientNumber, LegacyCode, OriginalTerm, EffectiveDate, Surname.y, Forenames.y, NumericValue) %>%
+            rename(Gender = Sex.x) %>%  
+            #filter(LegacyCode == local(input$text), !is.na(EffectiveDate)) %>%
+          #line below filters the clinical legacy code field with the code(s) entered by the user
+            filter(LegacyCode %in% local(input$text_string), !is.na(EffectiveDate)) %>%
+          #now, using collect() the data is downloaded into a local tibble.
+            collect() %>%
+            arrange(desc(EffectiveDate))
+        return(data)
+    })    
+
+#The SQL query is only executed when the base_data object is called.
+
+#The following code adds some additional variables to the filtered data within the R environment.
+
+data_mutate <- reactive({
+  data2 <- base_data() %>%
+  mutate(PatientAge = floor(age_calc(as.Date(DateOfBirth), enddate = Sys.Date(), units = "years", precise = TRUE)),
+         #Dateformat = as.POSIXct(EffectiveDate, "1970-01-01", format = "%y%m%d", tz = "GMT"),
+         ContactDate = as_date(EffectiveDate),
+         YearMonth = floor_date(as_date(EffectiveDate), "month"),
+         AgeGroup = cut(PatientAge, breaks = seq(0, 100, 5))) %>%
+    select(PatientId, LegacyCode,OriginalTerm, ContactDate, YearMonth, AgeGroup, Gender, NumericValue)
+  return(data2)
+})
+DT::renderDataTable(data_mutate(), options = list(scrollX = TRUE, pageLength = 10)) 
+                
+#striped = TRUE, bordered = TRUE, align = 'c', spacing = 'xs', hover = TRUE)
+
+```
+
+
+Column {data-width=400}
+-----------------------------------------------------------------------
+
+### Activity by Month (Since FY 17/18)
+
+```{r}
+
+#plot shows activity for selected code(s) by year/month.
+renderPlot({
+  monthly <- data_mutate() %>%
+    filter(YearMonth >= as.Date("2017-04-01")) %>%
+  group_by(YearMonth) %>%
+  summarise(
+    count = n())
+  
+ plot_monthly <-  ggplot(monthly, aes(x = YearMonth, y = count)) +
+  geom_col() +
+  scale_x_date(date_labels = "%b/%Y")
+ 
+ plot_monthly
+ 
+})
+
+```
+
+
+### Contacts by Age
+
+```{r}
+
+#Scatter plot shows age distribution of patients
+
+renderPlot({
+  contacts_age <- base_data() %>%
+  mutate(PatientAge = floor(age_calc(as.Date(DateOfBirth), enddate = Sys.Date(), units = "years", precise = TRUE)))%>%
+  group_by(PatientAge) %>%
+  summarise(
+    count = n()
+  ) 
+
+age_plot <- ggplot(contacts_age, aes(PatientAge, count)) +
+  geom_point() +
+  geom_smooth(method = "auto", se=TRUE, fullrange=FALSE, level=0.95)
+
+age_plot
+})
+
+
+```
+
+
+
+### Population Pyramid
+
+```{r}
+
+#Code below produces a population pyramid - including gender and age break down.
+
+renderPlot({
+  pop_pyr <- data_mutate() %>%
+  mutate(count = 1) %>%
+  select(Gender, AgeGroup, count)
+# aggregate the data by gender and age group
+pop_pyr <- aggregate(formula = count ~ Gender + AgeGroup, data = pop_pyr, FUN = sum)
+# barplots for male populations goes to the left (thus negative sign)
+pop_pyr$count <- ifelse(pop_pyr$Gender == "M", -1*pop_pyr$count, pop_pyr$count)
+
+# pyramid charts are two barcharts with axes flipped
+pyramid <- ggplot(pop_pyr, aes(x = AgeGroup, y = count, fill = Gender)) + 
+  geom_bar(data = subset(pop_pyr, Gender == "F"), stat = "identity") +
+  geom_bar(data = subset(pop_pyr, Gender == "M"), stat = "identity") + 
+  ##scale_y_continuous(labels = seq(100,300 ,100)) + 
+  coord_flip()
+pyramid
+})
+
+
+```
+
+Read Code Overview {data-icon="fa-stethoscope"}
+===================================== 
+
