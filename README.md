@@ -1,4 +1,4 @@
-# sql_via_r_dplyr
+# Query SQL via dplyr
 
 The script included provides an example of the use of dplyr in R to query a SQL database. This is done via the package dbplyr, which allows you to access remote database tables as if they are in-memory data frames by automatically converting dplyr code into SQL. 
 
